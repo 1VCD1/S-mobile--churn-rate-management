@@ -1,0 +1,555 @@
+---
+title: "S-Mobile: Predicting Customer Churn"
+output: html_document
+---
+
+* Team-lead gitlab id: rsm-sehughes
+* Group number: 13
+* Group name: Group 13
+* Team member names: Yizen Lou, Yuyan Wang, Yu-Wei Tang, Samuel Hughes
+
+```{r r_setup, include = FALSE}
+## initial settings
+knitr::opts_chunk$set(
+  comment = NA,
+  echo = TRUE,
+  error = TRUE,
+  cache = FALSE,
+  message = FALSE,
+  dpi = 96,
+  warning = FALSE
+)
+
+## width to use when printing tables etc.
+options(
+  width = 250,
+  scipen = 100,
+  max.print = 5000,
+  stringsAsFactors = FALSE
+)
+
+## load radiant packages if neededi
+if (!exists("r_environment")) library(radiant)
+```
+
+<style>
+.table {
+  width: auto;
+}
+ul, ol {
+  padding-left: 18px;
+}
+pre, code, pre code {
+  overflow: auto;
+  white-space: pre;
+  word-wrap: normal;
+  background-color: #ffffff;
+}
+</style>
+
+## Objective
+The objective of project is to:
+1. Explore data and find how different features affect churn rate.
+2. Estimate effect on churn rate when giving retention offers. 
+3. Calculate maximun budget of holding an campaigm or whether it's worthy to do so based on 60 months aggregate customer life time value.
+
+## Setup
+
+```{r}
+## Loading the data from Dropbox
+s_mobile <- readr::read_rds(file.path(radiant.data::find_dropbox(), "MGTA455-2019/data/s_mobile.rds"))
+s_mobile <- mutate(s_mobile, region = refactor(region, levs = c("NE","CS","NW","SE","SW"), repl = ""))
+s_mobile <- mutate(s_mobile, highcreditr = refactor(highcreditr, levs = c('yes', 'no'), repl = ""))
+```
+
+List all the variables we have
+```{r, echo = FALSE}
+# varaibles we have
+s_mobile %>% colnames()
+```
+
+### Add weight
+```{r, echo = FALSE}
+# Average churn rate of train set
+train_crate <- s_mobile %>% filter(training == 1) %>% summarise(churn_rate = mean(churn == 'yes'))
+
+# Average churn rate of whole population
+representative_crate <- s_mobile %>% filter(representative == 1) %>% summarise(churn_rate = mean(churn == 'yes'))
+
+print(paste('Average churn rate of train set:',train_crate,', Average churn rate of representative set:',representative_crate))
+```
+Seems that churn rate is unbalance in representative set but is balance in train set, so we should need to add weight when training model
+
+```{r}
+# Add weight variable
+s_mobile <- s_mobile %>% mutate(cweight = ifelse(churn == 'yes',2L,98L))
+```
+
+```{r}
+# Split the data into test, train and representative sets
+train <- s_mobile %>%
+  filter(training == 1)
+
+test <- s_mobile %>%
+  filter(training == 0)
+
+repre <- s_mobile %>%
+  filter(representative == 1)
+```
+
+## Question 1
+
+In addition to the logistic model, we tried a neural network, a decision tree an GBM model. Logistic did not have the best accuracy on the test set but it did have the best performace on the represenative set. None of the models perfromed particularly well, 69% accuracy was the best we were able to achieve. But with the negative effects after weighting the other models and the benefit of explainability of the logistic model, we chose to stick with the logistic model as our main choice.
+
+```{r}
+# build logistic model
+logit <- logistic(
+  train, 
+  rvar = "churn", 
+  evar = c(
+    "changer", "changem", "revenue", "mou", "overage", "roam", 
+    "conference", "months", "uniqsubs", "custcare", "retcalls", 
+    "dropvce", "eqpdays", "refurb", "smartphone", "highcreditr", 
+    "mcycle", "car", "travel", "region", "occupation"
+  ), 
+  lev = "yes", 
+)
+```
+
+```{r}
+# Calculate confusion matrix and accuracy
+pred <- predict(logit, pred_data = test) # predict on testing set
+test <- cbind(test, select(pred, Prediction)) # save it in the data frame
+df <- data.frame("TP" = test %>%
+                    filter(churn == 'yes' & Prediction > 0.5) %>% # if the prediction is over .5, we took
+                                                                # ...this as a prediction they would churn
+                                                                # ...because the training data is split
+                                                                # ...artificially 50/50, churn/non-churn
+                    nrow(),
+           "TN" = test %>%
+                    filter(churn == 'no' & Prediction < 0.5) %>%
+                    nrow(),
+           "FP" = test %>%
+                    filter(churn == 'no' & Prediction > 0.5) %>%
+                    nrow(),
+           "FN" = test %>%
+                    filter(churn == 'yes' & Prediction < 0.5) %>%
+                    nrow()
+) %>% mutate(`Acc (%)` = format_nr(100* (TP + TN) / (TP + TN + FP + FN), dec = 2))
+```
+
+```{r, echo=FALSE}
+# print table
+knitr::kable(df, caption = "Confusion Matrix and Accuracy")
+```
+
+Next, we created a logisitic regression model using all the available explanatory variables to predict churn for _representative_ data.
+
+```{r}
+# build logistic model with weights
+logit_w <- logistic(
+  train, 
+  rvar = "churn", 
+  evar = c(
+    "changer", "changem", "revenue", "mou", "overage", "roam", 
+    "conference", "months", "uniqsubs", "custcare", "retcalls", 
+    "dropvce", "eqpdays", "refurb", "smartphone", "highcreditr", 
+    "mcycle", "car", "travel", "region", "occupation"
+  ), 
+  lev = "yes", 
+  wts = "cweight"
+)
+repre$logit_pred <- predict(logit_w, pred_data = repre)$Prediction
+pred_chrun_rep <- repre %>%
+  summarise(a = mean(logit_pred))
+
+real_churn_rep <- repre %>%
+  summarise(a = mean(churn == 'yes'))
+```
+The predicted churn rate of the representative set using the weighted logisitc model is __`r format_nr(pred_chrun_rep * 100, dec = 2)`%__ and the actual churn rate is __`r format_nr(real_churn_rep * 100, dec = 2)`%__.
+
+## Question 2
+
+```{r}
+# Calculate importance of each variable in the logisitc model
+dummy <- c("refurb|yes", "smartphone|yes", "highcreditr|no",
+           "mcycle|yes", "travel|yes", "region|CS",
+           "region|NW", "region|SE" , "region|SW",
+           "occupation|professional", "occupation|student",
+           "occupation|retired") # identify dummy variables
+
+logit_coeff <- logit$coeff # Save the coefficiencts
+
+logit_coeff$SD <- c(0, sd(train$changer), sd(train$changem),
+                    sd(train$mou), sd(train$overage), 
+                    sd(train$roam), sd(train$months),
+                    sd(train$uniqsubs),sd(train$retcalls),
+                    sd(train$dropvce), sd(train$eqpdays),
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+logit_coeff <- logit_coeff %>%
+  filter(p.value < 0.1,
+         label != "(Intercept)") %>% # filter out explanitory vaiables that do not have high significance
+  mutate(`OR^(2 * SD)` = ifelse(label %in% dummy, OR, OR^(2 * SD))) # caclulate importance
+                                                               # different for dummy variables and 
+                                                               # ...non-dummy variables
+
+logit_coeff <- logit_coeff %>% # mutuate to relative importance
+  mutate(Importance = ifelse(`OR^(2 * SD)` > 1, `OR^(2 * SD)`, 1 / `OR^(2 * SD)`))
+
+df <- logit_coeff %>%
+  select(label, `OR^(2 * SD)`, Importance) %>% 
+  arrange(desc(Importance)) 
+```
+
+```{r, echo=FALSE}
+knitr::kable(df, caption = "Explanitary Variable Importance")
+```
+
+```{r, echo = FALSE}
+lowCred_imp <- df %>%
+  filter(label == "highcreditr|no") %>%
+  select(Importance)
+student_imp <- df %>%
+  filter(label == "occupation|student") %>%
+  select(Importance)
+refurb_imp <- df %>%
+  filter(label == "refurb|yes") %>%
+  select(Importance)
+```
+
+- There are a number of factors that appear to be the main drivers of churn but some of ones we are choosing to focus on are having low credit, being a student and having a refurbished phone. Their importance values are __`r format_nr(lowCred_imp, dec = 2)`__, __`r format_nr(student_imp, dec = 2)`__ and __`r format_nr(refurb_imp, dec = 2)`__ respectivly. These factors all seem to make sense. Students may be leaving S-mobile because they are on a budget and found a better deal at another company, professionals likely drive the competition between companyies by going with the company that has the highest speeds and highest quality. Retirees, on the other hand, likely do not care much about these factors and are thus least likely to churn. People with low credit scores likely have plenty of financial troubles and will churn because they found better deals or can no longer offord phone service. And finally, people with refurbished phones likely have phones that are not working as well and will move to other companies that offer a deal on a new phone when they sign a new contract.
+
+## Question 3
+
+- We have come up with 3 offers we plan to propose:
+
+1) Offer a students a discount on overage fees (or fee waiver). Students are likely the most price sensative so this should incentivize them monetarily and benefit the brand image with giveaways. Specifically in this proposal, for students who have overage costs in the past, we will give them additional 100 minutes for free. 
+
+2) Find ways to market towards retirees. If we are able to double the number of retirees in our customer base, it will help reduce the overall churn rates since retirees are significanly less likely to churn.
+
+3) Offer new phone deals to people with refurbished phones. This offer would be similar to offers other companies will be targeting at these people but will have the advantage of them not having to switch their provider.
+
+## Question 4
+
+1) Our first proposal ...
+
+```{r}
+student_repre <-repre
+
+student_repre <- student_repre %>%
+  mutate(overage = ifelse(occupation == "student", overage - 100, overage))
+
+student_repre <- student_repre %>%
+  mutate(overage = ifelse(overage < 0 , 0, overage))
+student_repre$pred_prob <- predict(logit_w, pred_data = student_repre)$Prediction
+
+target_index = which(repre$occupation == "student" & repre$overage > 0)
+target <- student_repre[target_index , ]
+orgin_stu_cr = mean(repre[target_index,]$logit_pred)
+
+now_stu_cr = mean(target$pred_prob)
+```
+
+For this segment, we are giving student customers an additional 100 minutes for free on top of their current plan. For this segment the churn rate in representative data set is __`r format_nr(orgin_stu_cr * 100, dec = 2)`%__. After removing the overage fees and then using our model to re-predict customer churn, their churn rate decreases to __`r format_nr(now_stu_cr * 100, dec = 2)`%__. 
+
+2) Our second proposal ...
+
+```{r}
+# Double retiree customer base
+retiree <- test %>% filter(occupation == 'retired')
+test_adjusted <- rbind(test, retiree)
+
+# Predict churn rate in original dataset and retiree-focus dataset
+test_adjusted$logit_pred <- predict(logit, pred_data = test_adjusted)$Prediction
+test$logit_pred <- predict(logit, pred_data = test)$Prediction
+
+# How much it difference?
+diff_test <- test %>% summarise(chur = mean(logit_pred)) - test_adjusted %>% summarise(chur = mean(logit_pred))
+```
+
+For the original customer base in the test set, we have an overall churn rate of __`r format_nr(test %>% summarise(chur = mean(logit_pred)) * 100, dec = 2)`%__.
+After we acquire more retired customers, the average churn rate becomes __`r format_nr(test_adjusted %>% summarise(chur = mean(logit_pred)) * 100, dec = 2)`%__.
+We see an improvement in churn rate of __`r format_nr(diff_test * 100, dec = 2)`%__.
+
+Let us see the impact at representative set as well:
+
+```{r}
+# Double retiree customer base
+rep_retiree <- repre %>% filter(occupation == 'retired')
+repre_adjusted <- rbind(repre,rep_retiree)
+
+# Predict churn rate in original dataset and retiree-focus dataset
+repre_adjusted$logit_pred <- predict(logit_w, pred_data = repre_adjusted)$Prediction
+repre$logit_pred <- predict(logit_w, pred_data = repre)$Prediction
+
+# How much it difference?
+diff_rep <- repre %>% summarise(chur = mean(logit_pred)) - repre_adjusted %>% summarise(chur = mean(logit_pred))
+```
+
+For the original customer base in the representative set, we have an overall churn rate of __`r format_nr(repre %>% summarise(chur = mean(logit_pred)) * 100, dec = 2)`%__.
+After we acquire more retired customers, the average churn rate becomes __`r format_nr(repre_adjusted %>% summarise(chur = mean(logit_pred)) * 100, dec = 2)`%__.
+We see an improvement in churn rate of __`r format_nr(diff_rep * 100, dec = 2)`%__.
+
+3) Our thrid proposal ... 
+
+```{r}
+## prediction for test set
+test$logit_pred <- predict(logit, pred_data = test)$Prediction
+
+test1 <- test %>%
+  filter(refurb=='yes') %>%
+  summarise(rate = mean(logit_pred))
+
+test1_adj <- test1$rate
+
+test_new <- test %>% 
+  filter(refurb=='yes') %>%
+  mutate(refurb = ifelse(refurb=='yes','no','no'))
+
+test_new$logit_pred <- predict(logit, pred_data = test_new)$Prediction
+
+test2 <- test_new %>%
+  summarise(rate = mean(logit_pred))
+
+test2_adj <- test2$rate
+
+diff1 <- test1_adj- test2_adj
+```
+
+The third proposal offers a new phone deal to customers using a refurbished phone, so the target of this action is customers in the data base who are reporedly using refurbished phones. From the test set we selected those customers who have a refurbished phone and set their "refurb" variable to 'no' then made prediction on this new dataset using our logistic model. We calculated average predicted churn probability then compared it with original data and got a __`r format_nr(diff1 * 100, dec = 2)`%__ decrease in churn rate. This supports our claim that our plan could contribute to imporved customer retention.
+
+```{r}
+## prediction for representative set
+repre$logit_pred <- predict(logit_w, pred_data = repre)$Prediction
+
+churn1 <- repre %>%
+  filter(refurb=='yes') %>%
+  summarise(rate = mean(logit_pred))
+
+rate1_adj <- churn1$rate
+
+repre2 <- repre %>% 
+  filter(refurb=='yes') %>%
+  mutate(refurb = ifelse(refurb=='yes','no','no'))
+
+repre2$logit_pred <- predict(logit_w, pred_data = repre2)$Prediction
+
+churn2 <- repre2 %>%
+  summarise(rate = mean(logit_pred))
+
+rate2_adj <- churn2$rate
+
+diff2 <- rate1_adj- rate2_adj
+```
+
+Next, we applied our model into customers who use refurbished phones in representitive set and calculated adjusted churn rate for two situations: renew their phone and do nothing. The monthly churn rate of applying our plan is __`r format_nr(diff2 * 100, dec = 2)`%__  lower than do nothing.
+
+## Question 5
+
+1) Our first proposal targets students who have a history of being charged overage fees. Students with overage fees have a higher churn rate than those who don't. 
+```{r, echo = FALSE}
+# caclulate churn rates of students with and without a history of overages
+df <- repre %>%
+  mutate(`History of Overage` = ifelse(overage == 0, 'No', 'Yes')) %>%
+  filter(occupation == 'student') %>%
+  group_by(`History of Overage`) %>%
+  summarise(`Average Churn (%)` = format_nr(mean(churn == 'yes') * 100, dec = 2))
+knitr::kable(df, caption = "Churn Rates of Students with and without a History of Overages")
+```
+This correlation indicates that waiving overage fees may have a beneficial effect on churn.
+
+2) Our second proposal targets retirees becuase of their low churn rates in the historical data. The goal of this action is to increase the percentage of retirees in our customer base. If this is achieved, we expect this to decrease our overall average churn rate and increase average customer lifetime value.
+
+**Action:**	Double retirees customer base
+
+**Tageting rule:** 	None, affects customer base
+
+**Expected churn benefit:**	 Baseline churn: `r repre %>% summarise(churn_rate = mean(logit_pred)* 100) %>% round(digit =2)` %, projected churn: `r repre_adjusted %>% summarise(churn_rate = mean(logit_pred) * 100) %>% round(digit =2)` %
+
+```{r, echo = FALSE}
+# calculate number of customers targeted in third proposal
+prop3_num <- repre %>%
+  filter(refurb == 'yes') %>%
+  nrow()
+```
+3) Our thrid proposal only targets customers who use a refurbished phone in representitive set. This happens to be __`r prop3_num`__ customers in the representative dataset. We will make this offer to all of these poeple as they are likely all already targets of competing company's marketing campeigns using similar tactics.
+
+## Question 6
+
+1) Our first proposal...
+
+```{r}
+# calculate cost per minute supplied
+cost_per_min <- mean(# averge revenue per minute supplied
+  repre %>%
+    filter(overage == 0,
+           mou > 0) %>%
+    mutate(cost_per_min = revenue / mou) %>% 
+    .$cost_per_min
+) * .25 # assuming 25% of revenue goes to operating costs
+```
+
+```{r}
+# CLV calculations
+monthly_origin_avgrev <- repre %>% filter(occupation == "student" & overage > 0) %>% summarise(avg_rev = mean(revenue)) %>% as.numeric()
+monthly_origin_cr <- repre %>% filter(occupation == "student" & overage > 0) %>% summarise(churn_rate = mean(logit_pred)) %>% as.numeric()
+target_index = which(repre$occupation == "student" & repre$overage > 0)
+monthly_discount_rate <- 0.005
+service_cost <- 0
+n_month <- 60
+time <- 1:n_month
+revenue <- c(monthly_origin_avgrev)
+survive_rate <- c(1 - monthly_origin_cr)
+origin_CLV <- tibble::tibble('month'= c('Now',rep(paste0('Month',1:(n_month)))),
+                          'revenue' = c(0,rep(revenue[1],n_month)),
+                          'sur_rate' = c(1,1,cumprod(rep(survive_rate[1],n_month-1))),
+                          'servicecost' = c(0,rep(service_cost,n_month)),
+                          'marketingcost' = rep(0,n_month+1),
+                          )
+origin_CLV <- origin_CLV %>% mutate(profit = revenue - servicecost - marketingcost)
+origin_CLV <- origin_CLV %>% mutate(expected_profit = profit * sur_rate)
+origin_CLV <- origin_CLV %>% mutate(PV_exp_profit = c(0,expected_profit[2:(n_month+1)]/(1 + monthly_discount_rate)^(0:(n_month - 1))))
+origin_CLV <- origin_CLV %>% mutate(CLV = cumsum(PV_exp_profit))
+#print(paste('Baseline CLV is',tail(origin_CLV$CLV,1)))
+origin_CLV$num <- 0:n_month
+#radiant.data::visualize(origin_CLV, xvar = 'num', yvar = "CLV", type = "line", custom = TRUE)
+monthly_student_cr <- target  %>% summarise(churn_rate = mean(pred_prob)) %>% as.numeric()
+
+monthly_discount_rate <- 0.005
+service_cost <- 0.14*100
+n_month <- 60
+
+# calculate CLV for proposal 
+time <- 1:n_month
+revenue <- c(monthly_origin_avgrev)
+survive_rate <- c(1 - monthly_student_cr)
+
+student_CLV <- tibble::tibble('month'= c('Now',rep(paste0('Month',1:(n_month)))),
+                          'revenue' = c(0,rep(revenue[1],n_month)),
+                          'sur_rate' = c(1,1,cumprod(rep(survive_rate[1],n_month-1))),
+                          'servicecost' = c(0,rep(service_cost,n_month)),
+                          'marketingcost' = rep(0,n_month+1),
+                          )
+student_CLV <- student_CLV %>% mutate(profit = revenue - servicecost - marketingcost)
+student_CLV <- student_CLV %>% mutate(expected_profit = profit * sur_rate)
+student_CLV <- student_CLV %>% mutate(PV_exp_profit = c(0,expected_profit[2:(n_month+1)]/(1 + monthly_discount_rate)^(0:(n_month - 1))))
+student_CLV<- student_CLV %>% mutate(CLV = cumsum(PV_exp_profit))
+
+#student_CLV
+#print(paste('Projected CLV is',tail(student_CLV$CLV,1)))
+student_CLV$num <- 0:n_month
+#radiant.data::visualize(student_CLV, xvar = 'num', yvar = "CLV", type = "line", custom = TRUE)
+```
+
+For our first proposal, we calculate every minute we give to a customer, we incur __S\$ `r format_nr(ceiling(cost_per_min*100)/100)`__ SGD per minute, so for each person every month, this action will cost S\$ __S\$ `r format_nr(ceiling(cost_per_min*100))`__ SGD.
+
+In a 5 years window, the orginial CLV for student who have overage is __`r tail(origin_CLV$CLV,1)`__. The CLV after the offer is __`r tail(student_CLV$CLV, 1)`__. 
+
+Value for this offer is __`r tail(student_CLV$CLV, 1)-tail(origin_CLV$CLV, 1)`__ per person. Projected to representative data, we can get __189.1353__ more profit. 
+
+2) Our second proposal, we evaluate economies by doing following:
+
+Calculate average CLV of original customer base
+
+```{r}
+## Homealarm revenue data
+monthly_origin_avgrev <- repre %>% summarise(avg_rev = mean(revenue)) %>% as.numeric()
+monthly_avgrev_adjusted <- repre_adjusted %>% summarise(avg_rev = mean(revenue)) %>% as.numeric()
+monthly_origin_cr <- repre %>% summarise(churn_rate = mean(logit_pred)) %>% as.numeric()
+monthly_cr_adjusted <- repre_adjusted %>% summarise(churn_rate = mean(logit_pred)) %>% as.numeric()
+
+## assumption
+monthly_discount_rate <- 0.005
+service_cost <- 0
+n_month <- 60
+
+# calculate CLV for origin userbase
+time <- 1:n_month
+revenue <- c(monthly_origin_avgrev, monthly_avgrev_adjusted)
+survive_rate <- c(1 - monthly_origin_cr, 1 - monthly_cr_adjusted)
+
+
+
+origin_CLV <- tibble::tibble('month'= c('Now',rep(paste0('Month',1:(n_month)))),
+                          'revenue' = c(0,rep(revenue[1],n_month)),
+                          'sur_rate' = c(1,1,cumprod(rep(survive_rate[1],n_month-1))),
+                          'servicecost' = c(0,rep(service_cost,n_month)),
+                          'marketingcost' = rep(0,n_month+1),
+                          )
+origin_CLV <- origin_CLV %>% mutate(profit = revenue - servicecost - marketingcost)
+origin_CLV <- origin_CLV %>% mutate(expected_profit = profit * sur_rate)
+origin_CLV <- origin_CLV %>% mutate(PV_exp_profit = c(0,expected_profit[2:(n_month+1)]/(1 + monthly_discount_rate)^(0:(n_month - 1))))
+origin_CLV <- origin_CLV %>% mutate(CLV = cumsum(PV_exp_profit))
+print(paste('Original average CLV is',tail(origin_CLV$CLV,1)))
+```
+
+Calculate average CLV after implementing propose
+
+```{r}
+Marketing_CLV <- tibble::tibble('month'= c('Now',rep(paste0('Month',1:(n_month)))),
+                          'revenue' = c(0,rep(revenue[2],n_month)),
+                          'sur_rate' = c(1,1,cumprod(rep(survive_rate[2],n_month-1))),
+                          'servicecost' = c(0,rep(service_cost,n_month)),
+                          'marketingcost' = rep(0,n_month+1),
+                          )
+Marketing_CLV <- Marketing_CLV %>% mutate(profit = revenue - servicecost - marketingcost)
+Marketing_CLV <- Marketing_CLV %>% mutate(expected_profit = profit * sur_rate)
+Marketing_CLV <- Marketing_CLV %>% mutate(PV_exp_profit = c(0,expected_profit[2:(n_month+1)]/(1 + monthly_discount_rate)^(0:(n_month - 1))))
+Marketing_CLV <- Marketing_CLV %>% mutate(CLV = cumsum(PV_exp_profit))
+print(paste('Projected average CLV is',tail(Marketing_CLV$CLV,1)))
+```
+
+See the difference of overall profit after implementing propose
+
+```{r}
+overall_CLV_origin <- tail(origin_CLV$CLV,1) * nrow(repre)
+overall_CLV_marketing <- tail(Marketing_CLV$CLV,1) * nrow(repre_adjusted)
+CLV_difference <- overall_CLV_marketing - overall_CLV_origin
+CLV_difference
+```
+
+Afterall, in 5 years window, to increase retiree customer base, we have budget up to `r CLV_difference %>% round(digit = 2)` SGD to set up campiagn to double retirees in our customer base.
+
+3) For our third proposal, our CLV Calculation resulted in the following.
+
+```{r}
+## assumptions
+ave_revenue <- repre %>% filter(refurb=='yes') %>% 
+  summarise(revenue=mean(revenue))
+monthly_revenue <- ave_revenue$revenue
+cost <- 0
+monthly_discount_rate <- 0.005
+nr_years <- 5
+time <- 1:(nr_years * 12)
+churn <- rate1_adj
+revenues <- rep(monthly_revenue, nr_years*12)
+active <- (1 - churn)^(time-1)
+exp_profit <- active * (revenues-cost)
+PV_exp_profit <- exp_profit / (1 + monthly_discount_rate)^time
+CLV <- cumsum(PV_exp_profit)
+AWS <- tibble::tibble(time, CLV)
+head(AWS)
+tail(AWS)
+```
+
+```{r}
+## assumptions
+churn <- rate2_adj
+revenues <- rep(monthly_revenue, nr_years*12)
+active <- (1 - churn)^(time-1)
+exp_profit <- active * (revenues-cost)
+PV_exp_profit <- exp_profit / (1 + monthly_discount_rate)^time
+CLV2 <- cumsum(PV_exp_profit)
+AWS <- tibble::tibble(time, CLV2)
+head(AWS)
+tail(AWS)
+```
+
+```{r}
+maxv_phone <- CLV2[60]-CLV[60]
+max_value <- maxv_phone * prop3_num
+```
+
+The maximum value of phone we are going to provide is __S\$ `r format_nr(maxv_phone, dec=2)`__ Singapore Dollars, equals to __$ `r format_nr(maxv_phone * 0.74, dec=2)`__ USD (1 SD = 0.74 USD).
+We are going to target __`r prop3_num`__ customers in representitive set.
